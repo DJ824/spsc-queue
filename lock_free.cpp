@@ -79,6 +79,8 @@ public:
 
         // use placement new to construct a new T object at the location of curr_tail.storage
         // std::forward preserves the value of the arg (lval/rval)
+        // need to use mem order release here to ensure when a reader accesses the tail, the object is already constructed, 
+        // else the compiler may reorder to first declare the tail as written, then construct the object 
         new (buffer_[curr_tail].storage) T(std::forward<U>(item));
         buffer_[curr_tail].written.store(true, std::memory_order_release);
         tail_.store(next_tail, std::memory_order_release);
