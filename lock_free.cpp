@@ -72,7 +72,6 @@ public:
         size_t curr_tail = tail_.load(std::memory_order_acquire);
         size_t next_tail = (curr_tail + 1) % SIZE;
 
-        // queue is full
         if (next_tail == head_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -91,12 +90,10 @@ public:
     __attribute__((always_inline)) std::optional<T> dequeue() {
         size_t curr_head = head_.load(std::memory_order_acquire);
 
-        // queue is full
         if (curr_head == tail_.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
 
-        // data not written yet
         if (!buffer_[curr_head].written.load(std::memory_order_release)) {
             return std::nullopt;
         }
