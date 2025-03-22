@@ -15,3 +15,6 @@ consumer dequeues -> tail_cache = 4, so we can keep dequeing until the head == t
 
 
 ![image](https://github.com/user-attachments/assets/81062fe4-fb20-4291-ae5f-f96b354d1701)
+
+
+ref: https://rigtorp.se/ringbuffer/
