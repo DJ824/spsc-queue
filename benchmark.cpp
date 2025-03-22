@@ -1,136 +1,180 @@
+#include "lock_free.cpp"
+#include <atomic>
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <thread>
-#include <chrono>
-#include <atomic>
-#include <iomanip>
-#include "lock_free.cpp"
+#include <vector>
 
-class Benchmark {
-private:
-    static constexpr size_t QUEUE_SIZE = 1024;
-    static constexpr size_t NUM_OPERATIONS = 10'000'000;
+void pinThread(int cpu) {
+  if (cpu < 0) {
+    return;
+  }
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu, &cpuset);
+  if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) ==
+      -1) {
+    perror("pthread_setaffinity_np");
+    exit(1);
+  }
+}
 
-    struct TestData {
-        int value;
-        char padding[60];
+int main(int argc, char *argv[]) {
+  int producer_cpu = -1;
+  int consumer_cpu = -1;
 
-        TestData(int v = 0) : value(v) {}
-    };
+  if (argc >= 3) {
+    producer_cpu = std::stoi(argv[1]);
+    consumer_cpu = std::stoi(argv[2]);
+    std::cout << "Pinning producer to CPU " << producer_cpu
+              << " and consumer to CPU " << consumer_cpu << std::endl;
+  }
 
-public:
-    void run_spsc() {
-        std::cout << "Single Producer Single Consumer Test\n";
-        std::cout << "===================================\n";
+  const size_t QUEUE_SIZE = 1024;
+  const size_t NUM_ITERATIONS = 10000000;
+  const int NUM_RUNS = 5;
 
-        for (int iteration = 0; iteration < 5; ++iteration) {
-            std::cout << "\nIteration " << iteration + 1 << ":\n";
-            run_single_iteration();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << "Queue capacity: " << QUEUE_SIZE - 1 << " elements" << std::endl;
+  std::cout << "Operations per test: " << NUM_ITERATIONS << std::endl;
+  std::cout << "Number of test runs: " << NUM_RUNS << std::endl << std::endl;
+
+  std::cout << "Single Producer, Single Consumer Throughput Test" << std::endl;
+  std::cout << "-----------------------------------------------" << std::endl;
+
+  for (int run = 0; run < NUM_RUNS; ++run) {
+    LockFreeQueue<int, QUEUE_SIZE> queue;
+    std::atomic<bool> producer_done(false);
+
+    auto consumer = std::thread([&] {
+      if (consumer_cpu >= 0)
+        pinThread(consumer_cpu);
+
+      size_t count = 0;
+      int expected_value = 0;
+
+      for (int i = 0; i < NUM_ITERATIONS; ++i) {
+        auto result = queue.front();
+        while (!result) {
+          result = queue.front();
+          if (producer_done.load(std::memory_order_acquire) && !result) {
+            break;
+          }
         }
+
+        if (result) {
+          if (*result != expected_value) {
+            std::cerr << "Error: Expected " << expected_value << " but got "
+                      << *result << std::endl;
+            exit(1);
+          }
+          expected_value++;
+          count++;
+          queue.pop();
+        }
+      }
+    });
+
+    if (producer_cpu >= 0)
+      pinThread(producer_cpu);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < NUM_ITERATIONS; ++i) {
+      while (!queue.enqueue(static_cast<int>(i))) {
+        std::this_thread::yield();
+      }
     }
 
-private:
-    void run_single_iteration() {
-        LockFreeQueue<TestData, QUEUE_SIZE> queue;
-        std::atomic<bool> start{false};
-        std::atomic<bool> producer_done{false};
-        std::atomic<size_t> consumed_count{0};
+    producer_done.store(true, std::memory_order_release);
+    consumer.join();
 
-        auto producer = [&]() {
-            while (!start.load(std::memory_order_acquire)) {}
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           end_time - start_time)
+                           .count();
 
-            auto start_time = std::chrono::high_resolution_clock::now();
-            size_t successful_enqueues = 0;
-            size_t total_attempts = 0;
+    double throughput = (NUM_ITERATIONS * 1000000.0) / duration_ns;
+    double latency = static_cast<double>(duration_ns) / NUM_ITERATIONS;
 
-            for (size_t i = 0; i < NUM_OPERATIONS; ++i) {
-                total_attempts++;
-                while (!queue.enqueue(TestData(i))) {
-                    total_attempts++;
-                    std::this_thread::yield();
-                }
-                successful_enqueues++;
-            }
+    std::cout << "Run " << (run + 1) << ":" << std::endl;
+    std::cout << "  Operations: " << NUM_ITERATIONS << std::endl;
+    std::cout << "  Duration: " << std::fixed << std::setprecision(2)
+              << (duration_ns / 1000000.0) << " ms" << std::endl;
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(2)
+              << throughput << " ops/ms" << std::endl;
+    std::cout << "  Latency: " << std::fixed << std::setprecision(2) << latency
+              << " ns/op" << std::endl;
+    std::cout << std::endl;
+  }
 
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+  std::cout << "Round-Trip Latency Test" << std::endl;
+  std::cout << "-----------------------------------------------" << std::endl;
 
-            double ops_per_sec = (successful_enqueues * 1e9) / duration.count();
-            double ns_per_op = static_cast<double>(duration.count()) / successful_enqueues;
-            double contention_ratio = static_cast<double>(total_attempts) / successful_enqueues;
+  for (int run = 0; run < NUM_RUNS; ++run) {
+    LockFreeQueue<int, QUEUE_SIZE> ping_queue;
+    LockFreeQueue<int, QUEUE_SIZE> pong_queue;
 
-            std::cout << "Producer Statistics:\n"
-                      << "  Throughput:     " << std::fixed << std::setprecision(2) << ops_per_sec << " ops/sec\n"
-                      << "  Latency:        " << std::fixed << std::setprecision(2) << ns_per_op << " ns/op\n"
-                      << "  Contention:     " << std::fixed << std::setprecision(2) << contention_ratio << " attempts/op\n";
+    auto worker = std::thread([&] {
+      if (consumer_cpu >= 0)
+        pinThread(consumer_cpu);
 
-            producer_done.store(true, std::memory_order_release);
-        };
+      for (size_t i = 0; i < NUM_ITERATIONS; ++i) {
+        auto result = ping_queue.front();
+        while (!result) {
+          result = ping_queue.front();
+        }
 
-        auto consumer = [&]() {
-            while (!start.load(std::memory_order_acquire)) {}
+        int value = *result;
+        ping_queue.pop();
 
-            auto start_time = std::chrono::high_resolution_clock::now();
-            size_t successful_dequeues = 0;
-            size_t total_attempts = 0;
+        while (!pong_queue.enqueue(value)) {
+          std::this_thread::yield();
+        }
+      }
+    });
 
-            while (successful_dequeues < NUM_OPERATIONS) {
-                total_attempts++;
-                if (auto item = queue.dequeue()) {
-                    successful_dequeues++;
-                } else if (producer_done.load(std::memory_order_acquire)) {
-                    if (successful_dequeues >= NUM_OPERATIONS) break;
-                    std::this_thread::yield();
-                } else {
-                    std::this_thread::yield();
-                }
-            }
+    if (producer_cpu >= 0)
+      pinThread(producer_cpu);
 
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-            double ops_per_sec = (successful_dequeues * 1e9) / duration.count();
-            double ns_per_op = static_cast<double>(duration.count()) / successful_dequeues;
-            double contention_ratio = static_cast<double>(total_attempts) / successful_dequeues;
+    for (size_t i = 0; i < NUM_ITERATIONS; ++i) {
+      while (!ping_queue.enqueue(static_cast<int>(i))) {
+        std::this_thread::yield();
+      }
 
-            std::cout << "Consumer Statistics:\n"
-                      << "  Throughput:     " << std::fixed << std::setprecision(2) << ops_per_sec << " ops/sec\n"
-                      << "  Latency:        " << std::fixed << std::setprecision(2) << ns_per_op << " ns/op\n"
-                      << "  Contention:     " << std::fixed << std::setprecision(2) << contention_ratio << " attempts/op\n";
+      auto response = pong_queue.front();
+      while (!response) {
+        response = pong_queue.front();
+      }
 
-            consumed_count.store(successful_dequeues, std::memory_order_release);
-        };
-
-        std::thread producer_thread(producer);
-        std::thread consumer_thread(consumer);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        auto test_start = std::chrono::high_resolution_clock::now();
-        start.store(true, std::memory_order_release);
-
-        producer_thread.join();
-        consumer_thread.join();
-
-        auto test_end = std::chrono::high_resolution_clock::now();
-        auto total_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(test_end - test_start);
-
-        double total_ops_per_sec = (consumed_count.load() * 1e9) / total_duration.count();
-        double total_ns_per_op = static_cast<double>(total_duration.count()) / consumed_count.load();
-
-        std::cout << "\nOverall Statistics:\n"
-                  << "  Total items:    " << consumed_count.load() << "\n"
-                  << "  Total time:     " << std::fixed << std::setprecision(2)
-                  << total_duration.count() / 1e6 << " ms\n"
-                  << "  Throughput:     " << std::fixed << std::setprecision(2)
-                  << total_ops_per_sec << " ops/sec\n"
-                  << "  Avg latency:    " << std::fixed << std::setprecision(2)
-                  << total_ns_per_op << " ns/op\n";
+      if (*response != static_cast<int>(i)) {
+        std::cerr << "Error: Expected " << i << " but got " << *response
+                  << std::endl;
+        exit(1);
+      }
+      
+      pong_queue.pop();
     }
-};
 
-int main() {
-    Benchmark benchmark;
-    benchmark.run_spsc();
-    return 0;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           end_time - start_time)
+                           .count();
+
+    worker.join();
+
+    double rtt = static_cast<double>(duration_ns) / NUM_ITERATIONS;
+
+    std::cout << "Run " << (run + 1) << ":" << std::endl;
+    std::cout << "  Round trips: " << NUM_ITERATIONS << std::endl;
+    std::cout << "  Duration: " << std::fixed << std::setprecision(2)
+              << (duration_ns / 1000000.0) << " ms" << std::endl;
+    std::cout << "  RTT Latency: " << std::fixed << std::setprecision(2) << rtt
+              << " ns" << std::endl;
+    std::cout << std::endl;
+  }
+
+  return 0;
 }
