@@ -11,35 +11,22 @@
 
 template <typename T, size_t SIZE> class LockFreeQueue {
 private:
-  struct Node {
-    std::atomic<bool> written_{false};
-    alignas(T) unsigned char storage_[sizeof(T)];
-
-    Node() noexcept = default;
-    ~Node() {
-      if (written_.load(std::memory_order_relaxed)) {
-        reinterpret_cast<T *>(storage_)->~T();
-      }
-    }
-
-    Node(const Node &) = delete;
-    Node &operator=(const Node &) = delete;
-  };
-
   static constexpr size_t CAPACITY = SIZE;
+
+  static constexpr size_t PADDING = (CACHE_LINE_SIZE - 1) / sizeof(T) + 1;
 
   alignas(CACHE_LINE_SIZE) std::atomic<size_t> head_{0};
   alignas(CACHE_LINE_SIZE) std::atomic<size_t> tail_{0};
   alignas(CACHE_LINE_SIZE) size_t head_cache_{0};
   alignas(CACHE_LINE_SIZE) size_t tail_cache_{0};
 
-  // ensure padding is the size of however many nodes fit in 1 cache line
-  static constexpr size_t PADDING = (CACHE_LINE_SIZE - 1) / sizeof(Node) + 1;
-  // pad the beginning and end of the array so that we are sharing cache line
-  // with adjacent allocatiions at the location the queue is allocated
-  alignas(CACHE_LINE_SIZE) std::array<Node, CAPACITY + 2 * PADDING> buffer_{};
+  alignas(
+      CACHE_LINE_SIZE) std::array<std::aligned_storage_t<sizeof(T), alignof(T)>,
+                                  CAPACITY + 2 * PADDING> buffer_{};
 
-  Node &get_node(size_t idx) { return buffer_[idx + PADDING]; }
+  T *get_slot(size_t idx) {
+    return reinterpret_cast<T *>(&buffer_[idx + PADDING]);
+  }
 
 public:
   LockFreeQueue() = default;
@@ -48,11 +35,7 @@ public:
     size_t curr_tail = tail_.load(std::memory_order_acquire);
 
     while (curr_head != curr_tail) {
-      Node &node = get_node(curr_head);
-      if (node.written_.load(std::memory_order_acquire)) {
-        reinterpret_cast<T *>(node.storage_)->~T();
-        node.written_.store(false, std::memory_order_release);
-      }
+      get_slot(curr_head)->~T();
       curr_head = (curr_head + 1) % CAPACITY;
     }
   }
@@ -63,7 +46,7 @@ public:
   LockFreeQueue &operator=(LockFreeQueue &&) = delete;
 
   template <typename U> bool enqueue(U &&item) {
-    const size_t curr_tail = tail_.load(std::memory_order_acquire);
+    const size_t curr_tail = tail_.load(std::memory_order_relaxed);
     const size_t next_tail = (curr_tail + 1) % CAPACITY;
 
     if (next_tail == head_cache_) {
@@ -72,40 +55,36 @@ public:
         return false;
       }
     }
-    new (get_node(curr_tail).storage_) T(std::forward<U>(item));
-    get_node(curr_tail).written_.store(true, std::memory_order_release);
-    tail_.store(next_tail, std::memory_order_release); 
+
+    new (get_slot(curr_tail)) T(std::forward<U>(item));
+
+    tail_.store(next_tail, std::memory_order_release);
     return true;
   }
 
-  T* front() {
-    const size_t curr_head = head_.load(std::memory_order_acquire);
+  T *front() {
+    const size_t curr_head = head_.load(std::memory_order_relaxed);
+
     if (curr_head == tail_cache_) {
       tail_cache_ = tail_.load(std::memory_order_acquire);
       if (curr_head == tail_cache_) {
-        return nullptr; 
+        return nullptr;
       }
     }
 
-    Node &node = get_node(curr_head);
-    if (!node.written_.load(std::memory_order_acquire)) {
-      return nullptr; 
-    }
-    return reinterpret_cast<T*>(node.storage_); 
+    return get_slot(curr_head);
   }
 
   void pop() {
-    const size_t curr_head = head_.load(std::memory_order_acquire);
-    Node &node = get_node(curr_head);
-    reinterpret_cast<T*>(node.storage_)->~T();
-    node.written_.store(false, std::memory_order_release);
+    const size_t curr_head = head_.load(std::memory_order_relaxed);
+
+    get_slot(curr_head)->~T();
+
     head_.store((curr_head + 1) % CAPACITY, std::memory_order_release);
-    
   }
 
   std::optional<T> dequeue() {
-    const size_t curr_head = head_.load(std::memory_order_acquire);
-    const size_t next_head = (curr_head + 1) % CAPACITY;
+    const size_t curr_head = head_.load(std::memory_order_relaxed);
 
     if (curr_head == tail_cache_) {
       tail_cache_ = tail_.load(std::memory_order_acquire);
@@ -114,21 +93,19 @@ public:
       }
     }
 
-    Node &node = get_node(curr_head);
-    if (!node.written_.load(std::memory_order_acquire)) {
-      return false;
-    }
-
-    T *item_ptr = reinterpret_cast<T *>(node.storage_);
+    T *item_ptr = get_slot(curr_head);
     std::optional<T> result(std::move(*item_ptr));
 
     item_ptr->~T();
-    node.written_.store(false, std::memory_order_release);
     head_.store((curr_head + 1) % CAPACITY, std::memory_order_release);
+
     return result;
   }
 
-  bool empty() const { return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire); }
+  bool empty() const {
+    return head_.load(std::memory_order_acquire) ==
+           tail_.load(std::memory_order_acquire);
+  }
 
   size_t size() const {
     const size_t head = head_.load(std::memory_order_acquire);
@@ -137,12 +114,9 @@ public:
     if (tail >= head) {
       return tail - head;
     } else {
-      return CAPACITY - (head - tail); 
+      return CAPACITY - (head - tail);
     }
   }
 
-  size_t capacity() const {
-    return CAPACITY - 1; 
-  }
-}; 
-
+  size_t capacity() const { return CAPACITY - 1; }
+};
