@@ -13,8 +13,12 @@ consumer dequeues -> tail_cache = 4, so we can keep dequeing until the head == t
 - another optimization technique is to add padding at the front and end of the queue to avoid false sharing with any adjacent memory allocations. the padding size is determined by how many queue slots fit into a single cache line, this avoids the head and tail from being in the same cache line as any other allocation your program might do, based on the original location the queue was allocated
 
 
-
+performance: 
 ![image](https://github.com/user-attachments/assets/81062fe4-fb20-4291-ae5f-f96b354d1701)
+
+using perf, we can see how aligning the head and tail + caches greatly improves our performance, doubled throughput and reduced cache misses by over half 
+
+![image](https://github.com/user-attachments/assets/aab48443-061c-4e33-af9a-06f174304ea1)
 
 
 ref: https://rigtorp.se/ringbuffer/
